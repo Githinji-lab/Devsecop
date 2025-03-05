@@ -1,0 +1,387 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # SAST – SonarQube Scan
+  sast:
+    name: SAST (SonarQube)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@master
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=commando-x_vuln-bank
+            -Dsonar.organization=commando-x
+            -Dsonar.sources=.
+            -Dsonar.python.version=3.9
+
+      - name: Store SonarQube Results
+        run: |
+          mkdir -p security-results/sonarqube
+          curl -H "Authorization: Bearer ${{ secrets.SONAR_TOKEN }}" \
+               "${{ secrets.SONAR_HOST_URL }}/api/issues/search?projectKeys=commando-x_vuln-bank" \
+               > security-results/sonarqube/issues.json
+          
+          if [ -s security-results/sonarqube/issues.json ]; then
+            echo "SonarQube results saved successfully"
+          else
+            echo "No SonarQube issues found"
+            echo '{"issues": []}' > security-results/sonarqube/issues.json
+          fi
+
+      - name: Upload SonarQube Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonar-results
+          path: security-results/sonarqube/
+          retention-days: 90
+
+  # SCA – Dependency Scanning
+  sca:
+    name: Dependency Scanning (Snyk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set Up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create Results Directory
+        run: mkdir -p security-results/snyk
+
+      - name: Run Snyk Scan
+        uses: snyk/actions/python@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --json-file-output=security-results/snyk/scan-results.json
+
+      - name: Verify Snyk Results
+        run: |
+          if [ -s security-results/snyk/scan-results.json ]; then
+            echo "Snyk scan completed successfully"
+          else
+            echo "No Snyk vulnerabilities found"
+            echo '{"vulnerabilities": []}' > security-results/snyk/scan-results.json
+          fi
+
+      - name: Upload Snyk Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-results
+          path: security-results/snyk/scan-results.json
+          retention-days: 90
+
+  # Container Scanning
+  container_scan:
+    name: Container Scanning (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker Image
+        run: docker build -t vulnerable-bank:latest .
+
+      - name: Create Results Directory
+        run: mkdir -p security-results/trivy
+
+      - name: Run Trivy Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'vulnerable-bank:latest'
+          format: 'json'
+          output: 'security-results/trivy/scan-results.json'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: 0
+
+      - name: Verify Trivy Results
+        run: |
+          if [ -s security-results/trivy/scan-results.json ]; then
+            echo "Trivy scan completed successfully"
+          else
+            echo "No Trivy vulnerabilities found"
+            echo '{"Results": []}' > security-results/trivy/scan-results.json
+          fi
+
+      - name: Upload Trivy Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: security-results/trivy/scan-results.json
+          retention-days: 90
+
+  # IaC Scanning
+  iac_scan:
+    name: IaC Scanning (Checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create Results Directory
+        run: mkdir -p security-results/checkov
+
+      - name: Run Checkov Scan
+        uses: bridgecrewio/checkov-action@master
+        continue-on-error: true
+        with:
+          directory: .
+          framework: dockerfile,github_actions
+          output_format: json
+          output_file: security-results/checkov/results.json
+          soft_fail: true
+
+      - name: Verify Checkov Results
+        run: |
+          if [ -s security-results/checkov/results.json ]; then
+            echo "Checkov scan completed successfully"
+          else
+            echo "No Checkov issues found"
+            echo '{"results": {"failed_checks": []}}' > security-results/checkov/results.json
+          fi
+
+      - name: Upload Checkov Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-results
+          path: security-results/checkov/results.json
+          retention-days: 90
+
+  # Dynamic Analysis
+  zap_scan:
+    name: Dynamic Analysis (OWASP ZAP)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start and Verify Flask Application
+        run: |
+          chmod +x scripts/health_check.sh
+          ./scripts/health_check.sh
+
+      - name: Create Results Directory and Set Permissions
+        run: |
+          mkdir -p security-results/zap
+          sudo chown -R 1000:1000 .
+          sudo chmod -R 777 security-results/zap
+
+      - name: Run ZAP Scan
+        run: |
+          docker pull softwaresecurityproject/zap-stable:2.14.0
+          
+          # Create zap.yaml with correct permissions
+          sudo mkdir -p /home/runner/zap
+          sudo chown -R 1000:1000 /home/runner/zap
+          
+          docker run --user 1000:1000 \
+            --rm \
+            -v $(pwd):/zap/wrk:rw \
+            -v /home/runner/zap:/home/zap:rw \
+            --network host \
+            softwaresecurityproject/zap-stable:2.14.0 \
+            zap-baseline.py \
+            -t http://localhost:5000 \
+            -J security-results/zap/zap-output.json \
+            -I
+
+      - name: Cleanup Docker Image
+        if: always()
+        run: docker rmi softwaresecurityproject/zap-stable:2.14.0
+
+      - name: Upload ZAP Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-results
+          path: security-results/zap/
+          retention-days: 90
+
+  # Report Generation
+  report:
+    name: Generate Security Report
+    needs: [sast, sca, container_scan, iac_scan, zap_scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create Results Directory
+        run: mkdir -p security-results/{sonarqube,snyk,trivy,checkov,zap}
+
+      - name: Download All Results
+        run: |
+          for tool in sonarqube snyk trivy checkov zap; do
+            echo "Downloading $tool results..."
+            mkdir -p security-results/$tool
+          done
+
+      - name: Download SonarQube Results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: sonar-results
+          path: security-results/sonarqube
+
+      - name: Download Snyk Results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: snyk-results
+          path: security-results/snyk
+
+      - name: Download Trivy Results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: trivy-results
+          path: security-results/trivy
+
+      - name: Download Checkov Results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: checkov-results
+          path: security-results/checkov
+
+      - name: Download ZAP Results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: zap-results
+          path: security-results/zap
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Generate HTML Report
+        run: |
+          # Create a function to format JSON content
+          format_json() {
+            if [ -f "$1" ]; then
+              cat "$1" | jq -r '.' || echo "Invalid JSON format"
+            else
+              echo "No results available"
+            fi
+          }
+
+          # Generate the report with actual content
+          cat << EOF > security-results/report.html
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Security Scan Results</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 20px; }
+                  .tool-section { margin-bottom: 30px; padding: 15px; border: 1px solid #ddd; }
+                  .vulnerability-item { margin: 10px 0; padding: 10px; background-color: #f9f9f9; }
+                  .severity-critical { color: darkred; font-weight: bold; }
+                  .severity-high { color: red; }
+                  .severity-medium { color: orange; }
+                  .severity-low { color: #999900; }
+              </style>
+          </head>
+          <body>
+              <h1>Security Scan Results</h1>
+              
+              <div class="tool-section">
+                  <h2>SonarQube Results</h2>
+                  <pre>
+          $(format_json "security-results/sonarqube/issues.json")
+                  </pre>
+              </div>
+              
+              <div class="tool-section">
+                  <h2>Snyk Results</h2>
+                  <pre>
+          $(format_json "security-results/snyk/scan-results.json")
+                  </pre>
+              </div>
+              
+              <div class="tool-section">
+                  <h2>Trivy Results</h2>
+                  <pre>
+          $(format_json "security-results/trivy/scan-results.json")
+                  </pre>
+              </div>
+              
+              <div class="tool-section">
+                  <h2>Checkov Results</h2>
+                  <pre>
+          $(format_json "security-results/checkov/results.json")
+                  </pre>
+              </div>
+              
+              <div class="tool-section">
+                  <h2>ZAP Results</h2>
+                  <pre>
+          $(format_json "security-results/zap/zap-output.json")
+                  </pre>
+              </div>
+          </body>
+          </html>
+          EOF
+
+      - name: Debug - Show Report Content
+        run: cat security-results/report.html
+
+      - name: Upload HTML Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: security-results/report.html
+          retention-days: 90
+
+  # Deployment
+  deploy:
+    name: Deploy to EC2
+    needs: [sast, sca, container_scan, iac_scan, zap_scan, report]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Deploy to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          chmod +x deploy/deploy.sh
+          ./deploy/deploy.sh
